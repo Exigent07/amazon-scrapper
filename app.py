@@ -27,7 +27,17 @@ logger = colorlog.getLogger()
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+# Fake User-Agent generator
 ua = UserAgent()
+
+def get_headers() -> dict:
+    """
+    Generates a random User-Agent header.
+
+    Returns:
+        dict: Headers with a randomized User-Agent.
+    """
+    return {"User-Agent": ua.random}
 
 def get_max_page(url: str) -> int:
     """
@@ -45,77 +55,64 @@ def get_max_page(url: str) -> int:
     Raises:
         ValueError: If the request fails or max pagination is missing.
     """
-
     response = requests.get(url, headers=get_headers())
+    
     if response.status_code != 200:
-        # Raise a ValueError if failed to fetch page
         raise ValueError(f"Failed to fetch page. Status code: {response.status_code}")
 
-    soup = BeautifulSoup(response.text, 'html.parser')
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    # Extract the pagination elements 
+    # Extract pagination elements
     max_elem = soup.select("span.s-pagination-item.s-pagination-disabled")
 
     if max_elem:
         try:
             return int(max_elem[-1].text.strip())  # Get the last/max page number
         except ValueError:
-            # Raise a ValueError if value for max pagination not found
             raise ValueError("Failed to extract the max page number.")
-    # Raise a ValueError if max pagination not found
+
     raise ValueError("Pagination information not found on the page.")
-
-def get_headers() -> dict:
-    """
-    Generates random user agent.
-
-    Returns:
-        dict: User agent header.
-    """
-    return {"User-Agent": ua.random}
 
 def get_seller(url: str) -> Union[str, bool]:
     """
     Retrieves the seller name if the product is in stock.
 
     Args:
-        url (str): The url to scrape from.
+        url (str): The product URL to scrape.
 
     Returns:
         Union[str, bool]: False if failed to fetch or the seller name on success.
     """
-
     response = requests.get(url, headers=get_headers())
 
     if response.status_code != 200:
-        logger.warning(f"Failed to fetch page {url}: {response.status_code}")
+        logger.warning(f"Failed to fetch seller page {url}: {response.status_code}")
         return False
 
     soup = BeautifulSoup(response.text, "html.parser")
 
     # Get the availability detail
-    stock_detail = soup.select("#availability").text.strip() or "N/A"
-    seller_detail = "N/A"
+    availability_elem = soup.select_one("#availability")
+    stock_detail = availability_elem.text.strip() if availability_elem else "N/A"
+    
+    seller_elem = soup.select_one("#sellerProfileTriggerId")
+    seller_detail = seller_elem.text.strip() if seller_elem else "N/A"
 
-    # Get the seller name if not out of stock
-    if stock_detail == "In stock":
-        seller_detail = soup.select("#sellerProfileTriggerId").text.strip() or "N/A"
-
-    return seller_detail
+    return seller_detail if stock_detail == "In stock" else "N/A"
 
 def scrape_page(url: str, page_number: int) -> list[dict]:
     """
-    Scrapes a single page.
+    Scrapes a single page of product listings.
 
     Args:
-        url (str): The url to scrape.
+        url (str): The base Amazon search URL.
         page_number (int): The page number to scrape.
 
     Returns:
         list[dict]: A list of extracted product details.
     """
-    url = f"{url}&page={page_number}"
-    response = requests.get(url, headers=get_headers())
+    page_url = f"{url}&page={page_number}"
+    response = requests.get(page_url, headers=get_headers())
 
     if response.status_code != 200:
         logger.warning(f"Failed to fetch page {page_number}: {response.status_code}")
@@ -124,7 +121,7 @@ def scrape_page(url: str, page_number: int) -> list[dict]:
     soup = BeautifulSoup(response.text, "html.parser")
     products = []
 
-    # From the main div select all product details
+    # Extract product details
     for item in soup.select("div.a-section.a-spacing-small.puis-padding-left-small.puis-padding-right-small"):
         title_elem = item.select_one("h2.a-size-base-plus.a-spacing-none.a-color-base.a-text-normal")
         price_elem = item.select_one("span.a-price-whole")
@@ -134,14 +131,10 @@ def scrape_page(url: str, page_number: int) -> list[dict]:
         title = title_elem.text.strip() if title_elem else "N/A"
         price = price_elem.text.strip() if price_elem else "N/A"
         rating = rating_elem.text.strip() if rating_elem else "N/A"
-        seller_url = seller_url_elem.get("href", "N/A")
+        
+        seller_url = f"https://www.amazon.in{seller_url_elem.get('href')}" if seller_url_elem else "N/A"
+        seller_detail = get_seller(seller_url) if seller_url != "N/A" else "N/A"
 
-        if seller_url != "N/A":
-            seller_detail = get_seller(seller_url)
-        else:
-            seller_detail = "N/A"
-
-        # Append the current product details to the list
         products.append({"title": title, "price": price, "rating": rating, "seller": seller_detail})
 
     logger.info(f"Scraped page {page_number}: {len(products)} products found.")
@@ -151,51 +144,29 @@ def scrape_amazon(pages: Union[str, int] = 1, csv_path: str = "output.csv", thre
     """
     Scrapes Amazon product listings and extracts key details.
 
-    This function scrapes Amazon product listings and retrieves:
-    - **Product Name**
-    - **Price**
-    - **Rating**
-    - **Seller Name** (if not out of stock)
-
     The extracted data is saved into a CSV file.
 
     Args:
-        pages (Union[str, int]): The number of pages to scrape.
-            - If an **integer**, it must be **1 or higher**.
-            - If a **string**, it must be `"all"` (to scrape all available pages).
-        csv_path (str): The file path to save the extracted data as a CSV file.
-        threads (Literal[5, 10, 25, 50]): The number of threads to use for concurrent scraping.
+        pages (Union[str, int]): Number of pages to scrape or "all" for max pages.
+        csv_path (str): File path to save extracted data as a CSV file.
+        threads (Literal[5, 10, 25]): Number of threads for concurrent scraping.
 
     Returns:
         bool: `True` if scraping is successful, otherwise `False`.
 
     Raises:
-        ValueError: If `pages` is a string other than `"all"`.
-        ValueError: If `pages` is an integer less than 1.
-
-    Notes:
-        - Uses threading for faster scraping.
-        - Requires handling for Amazon's anti-bot mechanisms.
+        ValueError: If `pages` is invalid.
     """
 
     if isinstance(pages, str) and pages != "all":
-        # Raise a ValueError if the string isn't "all"
-        raise ValueError(f"Provided an invalid page number: '{pages}'")
+        raise ValueError(f"Invalid page number: '{pages}'")
     elif isinstance(pages, int) and pages < 1:
-        # Raise a ValueError if the integer is less than 1
         raise ValueError("Pages cannot be negative or 0")
 
-    # The URL to scrape
-    URL = r"https://www.amazon.in/s?rh=n%3A6612025031&fs=true&ref=lp_6612025031_sar"
+    # Base URL to scrape
+    URL = "https://www.amazon.in/s?rh=n%3A6612025031&fs=true&ref=lp_6612025031_sar"
 
-    # URL params
-    params = {
-        "page": "page", # page param to change pages
-    }
-
-    max_page = get_max_page(URL)
-
-    # If "all" is passed, get the max number of pages
+    # Get max pages if "all" is specified
     if pages == "all":
         try:
             pages = get_max_page(URL)
@@ -213,7 +184,7 @@ def scrape_amazon(pages: Union[str, int] = 1, csv_path: str = "output.csv", thre
         products = scrape_page(URL, page)
         with lock:
             all_products.extend(products)
-        time.sleep(1) # We should increase the delay to not get blocked by amazon
+        time.sleep(1.5)  # Increased delay to avoid blocking
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
         executor.map(scrape_and_store, range(1, pages + 1))
@@ -229,5 +200,5 @@ def scrape_amazon(pages: Union[str, int] = 1, csv_path: str = "output.csv", thre
     logger.info(f"Data saved to {csv_path}.")
     return True
 
-# Scrape!!!
+# Start scraping
 scrape_amazon("all", "products.csv", threads=25)
